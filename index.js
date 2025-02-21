@@ -14,10 +14,14 @@ const {version} = require('./package');
 program
 .version(version)
 .option('-g, --generate', 'generate a static license summary file')
+.option('-t, --type <type>', 'specify the type of the output file (html, json, csv)')
 .option('-b, --browser', 'open up a browser and show generated static license summary file')
 .option('--no-browser', 'prevents the browser from popping open')
 .option('-i, --info', 'provides information about all direct dependency licenses')
 .option('-o, --outputFilePath <path>', 'specify path and name of the output file')
+.option('-nd, --no-dev', 'do not include devDependencies')
+.option('-r, --recursive', 'recursively search for licenses in subdirectories')
+.option('-d, --max-depth <depth>', 'set the maximum depth for recursive search')
 .option('-v, --verbose', 'activate verbose logging ')
 .parse(process.argv);
 
@@ -37,6 +41,10 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
     const composerFileExists = fs.existsSync('./composer.json');
     const nodeModulesExists = fs.existsSync('./node_modules');
     const vendorFolderExists = fs.existsSync('./vendor');
+
+    const recursive = program.recursive || false;
+    const maxDepth = program.maxDepth || (recursive ? 0 : 1);
+    const verbose = program.verbose || false;
 
     if (!packageFileExists && !composerFileExists) {
       console.error(chalk.red('There is no dependency file (package,json or composer.json) in the current directory.'));
@@ -58,6 +66,7 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
         message: chalk.magentaBright('Which source file should get parsed?'),
         initial: 0,
         choices: [
+          {title: chalk.blueBright('all'), value: 'all'},
           {title: chalk.blueBright('package.json'), value: 'package.json'},
           {title: chalk.blueBright('composer.json'), value: 'composer.json'}
         ],
@@ -68,26 +77,123 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
       sourceFile = packageFileExists ? 'package.json' : 'composer.json';
     }
 
-    const isPackageMode = () => sourceFile === 'package.json';
-    const isComposerMode = () => sourceFile === 'composer.json';
-    const folder = isPackageMode() ? 'node_modules' : 'vendor';
+    const isPackageMode = (type = sourceFile) => ['package.json', 'js'].includes(type);
+    const isComposerMode = (type = sourceFile) => ['composer.json', 'php'].includes(type);
+    const typeFile = (type = sourceFile) => isPackageMode(type) ? 'package.json' : 'composer.json';
+    const typeFolder = (type = sourceFile) => isPackageMode(type) ? 'node_modules' : 'vendor';
+    const folder = typeFolder(sourceFile);
 
-    const content = fs.readFileSync('./' + sourceFile, 'utf-8');
-    let dependencies = Object.keys(JSON.parse(content)[isPackageMode() ? 'dependencies' : 'require']);
-    if (isComposerMode()) dependencies = dependencies.filter(d => d.indexOf('/') >= 0);
-    console.log(chalk.magentaBright('Found %d dependencies.'), dependencies.length);
+    let packageDependencies = [];
+    let composerDependencies = [];
+    let dependencies = [];
+
+    let sourceFiles = 'all' === sourceFile ? ['package.json', 'composer.json'] : [sourceFile];
+
+    if (program.recursive) {
+      // Walk through sourceFiles and search for same file name recursively in all depth levels
+      // and add them to sourceFiles
+      const walk = (dir, depth = 0) => {
+        const files = fs.readdirSync(dir);
+        for (let file of files) {
+          const filePath = dir + '/' + file;
+          if (fs.statSync(filePath).isDirectory()
+            && (maxDepth === 0 || depth < maxDepth)
+            && !['node_modules', 'vendor'].includes(file)
+          ) {
+            walk(filePath, depth + 1);
+            continue;
+          }
+          if (sourceFiles.includes(file)
+            && dir !== '.'
+          ) {
+            sourceFiles.push(filePath);
+          }
+        }
+      };
+
+      walk('.');
+
+      // Remove duplicates
+      sourceFiles = [...new Set(sourceFiles)];
+
+      console.log(chalk.magentaBright('Found %d files to scan recursively'), sourceFiles.length);
+    }
+
+    if (verbose) console.log(chalk.magentaBright('Reading dependencies from %s...'), sourceFiles.join(', '));
+
+    for (let sourceFilePath of sourceFiles) {
+      const sourceFile = sourceFilePath.split('/').reverse()[0];
+      const sourcePath = sourceFilePath.split('/').slice(0, -1).join('/');
+      if (!fs.existsSync('./' + sourceFile)) {
+        console.log(chalk.red('File "%s" does not exist.'), sourceFile);
+        return;
+      }
+
+      let type = sourceFile === 'package.json' ? 'js' : 'php';
+      if (verbose) {
+        console.log(chalk.magentaBright('Reading dependencies from %s...'), sourceFile);
+      }
+
+      let typeDependencies = [];
+
+      const content = fs.readFileSync('./' + sourceFilePath, 'utf-8');
+      // Try to parse content as JSON and get dependencies and development dependencies
+      try {
+        const parsedContent = JSON.parse(content);
+        typeDependencies = Object.keys(parsedContent[isPackageMode(sourceFile) ? 'dependencies' : 'require'] || {});
+        if (!program.noDev) {
+          typeDependencies = typeDependencies
+            .concat(Object.keys(parsedContent[isPackageMode(sourceFile) ? 'devDependencies' : 'require-dev'] || {}));
+        }
+      } catch (e) {
+        console.error(chalk.red('Error parsing file "%s"'), sourceFile, e);
+
+        return;
+      }
+      if (isComposerMode(sourceFile)) {
+        typeDependencies = typeDependencies.filter(d => d.indexOf('/') >= 0);
+      }
+
+      if (isPackageMode(sourceFile)) {
+        packageDependencies = typeDependencies;
+      } else {
+        composerDependencies = typeDependencies;
+      }
+
+      // Add all type dependencies to the dependencies array, each as an object with the type
+      dependencies = dependencies.concat(typeDependencies.map(d => {
+        return {
+          name: d,
+          path: sourcePath,
+          type
+        };
+      }));
+
+      // Remove duplicates
+      dependencies = dependencies.filter((d, i) => dependencies.findIndex(_d => _d.name === d.name) === i);
+
+      // Sort dependencies by name
+      dependencies = dependencies.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    console.log(chalk.magentaBright(
+      program.noDev ? 'Found %d dependencies' : 'Found %d dependencies and dev dependencies',
+    ), dependencies.length);
 
     const spinner = ora({
-      text: chalk.magentaBright('Scanning ' + folder + '/'),
+      text: chalk.magentaBright('Scanning'),
       color: 'magenta'
     });
-    if (!program.verbose) spinner.start();
+    if (!verbose) spinner.start();
 
     const sanitizeLicenseLabel = (label) => {
       if (!label) return null;
 
-      return label
-      .replace('-', ' ');
+      if (typeof label === 'array') {
+        return label.map(l => sanitizeLicenseLabel(l)).join(', ');
+      }
+
+      return `${label}`.replace('-', ' ');
     };
 
     const licenseItems = [];
@@ -95,18 +201,36 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
     const failures = [];
     let licenseFileCounter = 0;
     let licenseDownloadCounter = 0;
-    for (let dependency of dependencies) {
+    for ({name: dependency, path, type} of dependencies) {
+      if (!dependency) continue;
+      const _folder = typeFolder(type);
+      // console.log({dependency, path, type, _folder});
       try {
-        let dependencyFolder = fs.existsSync(`./${folder}/${dependency}`) ?
-          `./${folder}/${dependency}` :
-          `./${dependency.split('/').reverse()[0]}`;
+        const dependencyRoot = path ? `${path}` : '.';
+        let dependencyFolder = fs.existsSync(`${dependencyRoot}/${_folder}/${dependency}`) ?
+          `${dependencyRoot}/${_folder}/${dependency}` :
+          `${dependencyRoot}/${dependency.split('/').reverse()[0]}`;
+        if (!fs.existsSync(dependencyFolder)) {
+          if (verbose) console.warn(chalk.red('Did not find directory for "%s"'), {
+            dependency,
+            path,
+            type,
+            _folder,
+            dependencyFolder
+          }.toString());
+          failures.push(dependency);
+        }
         const dependencyFolderFiles = fs.readdirSync(dependencyFolder);
-        const descriptionFile = JSON.parse(fs.readFileSync(`./${dependencyFolder}/${sourceFile}`, 'utf-8'));
+        const descriptionFile = JSON.parse(fs.readFileSync(`./${dependencyFolder}/${typeFile(type)}`, 'utf-8'));
+
+        const url = descriptionFile.repository?.url || descriptionFile.repository;
 
         const licenseItem = {
           module: dependency,
           type: sanitizeLicenseLabel(descriptionFile.license),
-          description: descriptionFile.description || null
+          description: descriptionFile.description || null,
+          packageType: type,
+          url: descriptionFile.repository ? descriptionFile.repository.url : null
         };
 
         // Check for license file
@@ -120,20 +244,20 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
         }
 
         // Check for repository
-        if ((isPackageMode() && descriptionFile.hasOwnProperty('repository')) || isComposerMode()) {
+        if ((isPackageMode(type) && descriptionFile.hasOwnProperty('repository')) || isComposerMode(type)) {
           const fetchLicenseFileFromRepo = async (url) => {
             let message = 'Trying to fetch license file from "' + url + '"... ';
             const response = await request(url);
             message += response.code >= 400 ? 'failed (' + response.code + ')' : 'succeeded';
-            if (program.verbose) console.log(chalk.blueBright(message));
+            if (verbose) console.log(chalk.blueBright(message));
 
             return response;
           };
 
           let rawUrl;
-          if (isPackageMode()) {
-            const url = descriptionFile.repository.url;
-            const repoUrl = url.replace(/^git\+/, '')
+          if (isPackageMode(type)) {
+            const url = new URL(url);
+            const repoUrl = url.href.replace(/^git\+/, '')
             .replace(/\.git$/, '')
             .replace('ssh://git@', 'https://');
 
@@ -143,7 +267,7 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
             rawUrl = 'https://raw.githubusercontent.com/' + dependency;
           }
 
-          for (let branch of ['master', 'dev', 'develop']) {
+          for (let branch of ['main', 'master', 'dev', 'develop']) {
             for (let licenseFilename of LICENSE_FILENAMES) {
               const fullRequestUrl = `${rawUrl}/${branch}/${licenseFilename}`;
 
@@ -174,13 +298,13 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
         }
 
         failures.push(dependency);
-        if (program.verbose) console.warn(chalk.red('No file or download available for "%s"'), dependency);
+        if (verbose) console.warn(chalk.red('No file or download available for "%s"'), dependency);
         licenseItems.push(licenseItem);
       } catch (e) {
-        if (program.verbose) console.warn(chalk.red('Did not find directory for "%s"'), dependency, e);
+        if (verbose) console.warn(chalk.red('Did not find directory for "%s"'), dependency, e);
       }
     }
-    if (!program.verbose) spinner.succeed(chalk.magentaBright('Scanning node_modules/... done!'));
+    if (!verbose) spinner.succeed(chalk.magentaBright('Scanning done!'));
 
     console.log(chalk.magentaBright('The following licenses are used:'),
       [...new Set(licenseItems.map(i => i.type))].filter(i => i).join(', ')
@@ -220,33 +344,63 @@ const LICENSE_FILENAMES = ['LICENSE', 'LICENSE.md', 'license', 'license.md', 'LI
     }
 
     if (program.generate) {
-      const filePath = program.outputFilePath || (os.tmpdir() + '/license.html');
+      const fileType = program.type || 'html';
+      if (['html', 'json', 'csv'].includes(fileType)) {
+        const filePath = program.outputFilePath || (os.tmpdir() + '/license.' + fileType);
 
-      console.log(chalk.cyanBright('Creating license HTML file (' + filePath + ')...'));
-      let html = '';
-      for (let f of licenseItems) {
-        let licenseText = f['license'] || 'No license file provided.';
+        console.log(chalk.cyanBright('Creating license summary file to "%s"...'), filePath);
+        let output = '';
+        for (let f of licenseItems) {
+          let licenseText = f['license'] || 'No license file provided.';
 
-        html += `
-      <h2>${f['module']}</h2>
-      <p>${f['type'] ? `<strong>${f['type']}</strong> - ` : ''}${f['description']}</p>
-      <pre>${licenseText}</pre>
-      <hr>
-    `;
-      }
-
-      fs.writeFileSync(filePath, html, 'utf-8');
-
-      if (program.browser !== false) {
-        let showInBrowser = program.browser;
-        if (!showInBrowser) {
-          showInBrowser = await yesno({
-            question: chalk.cyanBright('Show output file in browser? (Y/n)'),
-            defaultValue: 'y'
-          });
+          if (fileType === 'html') {
+            output += `
+        <details open>
+          <summary>${f['module']} - ${f['type'] || 'No license provided'} - ${f['packageType']}</summary>
+          <p>${f['type'] ? `<strong>${f['type']}</strong> - ` : ''}${f['description']}</p>
+          <pre>${licenseText}</pre>
+          <p>${f['url'] ? `Repository: <a href="${f['url']}" target="_blank">${f['url']}</a>` : ''}</p>
+        </details>
+      `;
+          } else if (fileType === 'json') {
+            const entry = {
+              module: f['module'],
+              description: f['description'],
+              license: f['type'] || 'No license provided',
+              packageType: f['packageType'],
+              url: f['url']
+            };
+            output += JSON.stringify(entry, null, 2) + ',\n';
+          } else if (fileType === 'csv') {
+            // Use CSV format, with ',' as separator and '"' as enclosure
+            const entry = [
+              f['module'],
+              f['type'],
+              f['url'],
+            ];
+            output += entry.map(e => e ? `"${e}"` : null).join(',') + '\n';
+          }
         }
 
-        if (showInBrowser) opn(filePath);
+        if (fileType === 'json') {
+          output = '[' + output.slice(0, -2) + ']';
+        } else if (fileType === 'csv') {
+          output = '"module","type","url"\n' + output;
+        }
+
+        fs.writeFileSync(filePath, output, 'utf-8');
+
+        if (program.browser !== false) {
+          let showInBrowser = program.browser;
+          if (!showInBrowser) {
+            showInBrowser = await yesno({
+              question: chalk.cyanBright('Show output file in browser? (Y/n)'),
+              defaultValue: 'y'
+            });
+          }
+
+          if (showInBrowser) opn(filePath);
+        }
       }
     }
   } catch (e) {
